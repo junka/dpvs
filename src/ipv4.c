@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -26,6 +26,7 @@
 #include "neigh.h"
 #include "icmp.h"
 #include "parser/parser.h"
+#include "iftraf.h"
 
 #define IPV4
 #define RTE_LOGTYPE_IPV4    RTE_LOGTYPE_USER1
@@ -101,27 +102,30 @@ struct ip4_stats ip4_statistics;
 rte_spinlock_t ip4_stats_lock;
 #endif
 
-#ifdef CONFIG_DPVS_IPV4_DEBUG
-static void ip4_dump_hdr(const struct ipv4_hdr *iph, portid_t port)
+#ifdef CONFIG_DPVS_IP_HEADER_DEBUG
+static void ip4_show_hdr(const char *func, const struct rte_mbuf *mbuf)
 {
-    char saddr[16], daddr[16];
+    portid_t port;
     lcoreid_t lcore;
+    struct ipv4_hdr *iph;
+    char saddr[16], daddr[16];
 
+    port = mbuf->port;
+    iph = ip4_hdr(mbuf);
     lcore = rte_lcore_id();
 
     if (!inet_ntop(AF_INET, &iph->src_addr, saddr, sizeof(saddr)))
         return;
+
     if (!inet_ntop(AF_INET, &iph->dst_addr, daddr, sizeof(daddr)))
         return;
 
-    fprintf(stderr, "lcore %u port%u ipv4 hl %u tos %u tot %u "
+    RTE_LOG(DEBUG, IPV4, "%s: [%d] port %u ipv4 hl %u tos %u tot %u "
             "id %u ttl %u prot %u src %s dst %s\n",
-            lcore, port, IPV4_HDR_IHL_MASK & iph->version_ihl,
+            func, lcore, port, IPV4_HDR_IHL_MASK & iph->version_ihl,
             iph->type_of_service, ntohs(iph->total_length),
             ntohs(iph->packet_id), iph->time_to_live,
             iph->next_proto_id, saddr, daddr);
-
-    return;
 }
 #endif
 
@@ -235,9 +239,6 @@ static int ipv4_output_fin2(struct rte_mbuf *mbuf)
     mbuf->packet_type = ETHER_TYPE_IPv4;
     mbuf->l3_len = ip4_hdrlen(mbuf);
 
-    /* reuse @userdata/@udata64 for prio (used by tc:pfifo_fast) */
-    mbuf->udata64 = ((ip4_hdr(mbuf)->type_of_service >> 1) & 15);
-
     err = neigh_output(AF_INET, (union inet_addr *)&nexthop, mbuf, rt->port);
     route4_put(rt);
     return err;
@@ -259,6 +260,8 @@ int ipv4_output(struct rte_mbuf *mbuf)
     assert(rt);
 
     IP4_UPD_PO_STATS(out, mbuf->pkt_len);
+    mbuf->port = rt->port->id;
+    iftraf_pkt_out(AF_INET, mbuf, rt->port);
 
     return INET_HOOK(AF_INET, INET_HOOK_POST_ROUTING, mbuf,
             NULL, rt->port, ipv4_output_fin);
@@ -320,7 +323,7 @@ static int ip4_rcv_options(struct rte_mbuf *mbuf)
     return EDPVS_OK;
 }
 
-static int ipv4_rcv_fin(struct rte_mbuf *mbuf)
+int ipv4_rcv_fin(struct rte_mbuf *mbuf)
 {
     int err;
     struct route_entry *rt = NULL;
@@ -372,6 +375,9 @@ drop:
 
 static int ipv4_rcv(struct rte_mbuf *mbuf, struct netif_port *port)
 {
+#ifdef CONFIG_ICMP_REDIRECT_CORE
+        struct icmphdr *ich, _icmph;
+#endif
     struct ipv4_hdr *iph;
     uint16_t hlen, len;
     eth_type_t etype = mbuf->packet_type; /* FIXME: use other field ? */
@@ -383,7 +389,7 @@ static int ipv4_rcv(struct rte_mbuf *mbuf, struct netif_port *port)
     }
 
     IP4_UPD_PO_STATS(in, mbuf->pkt_len);
-
+    iftraf_pkt_in(AF_INET, mbuf, port);
     if (mbuf_may_pull(mbuf, sizeof(struct ipv4_hdr)) != 0)
         goto inhdr_error;
 
@@ -418,8 +424,23 @@ static int ipv4_rcv(struct rte_mbuf *mbuf, struct netif_port *port)
     mbuf->userdata = NULL;
     mbuf->l3_len = hlen;
 
-#ifdef CONFIG_DPVS_IPV4_DEBUG
-    ip4_dump_hdr(iph, mbuf->port);
+#ifdef CONFIG_DPVS_IP_HEADER_DEBUG
+    ip4_show_hdr(__func__, mbuf);
+#endif
+
+    if (unlikely(iph->next_proto_id == IPPROTO_OSPF))
+        return EDPVS_KNICONTINUE;
+#ifdef CONFIG_ICMP_REDIRECT_CORE
+    else if (unlikely(iph->next_proto_id == IPPROTO_ICMP)) {
+        ich = mbuf_header_pointer(mbuf, hlen, sizeof(_icmph), &_icmph);
+        if (unlikely(!ich))
+            goto drop;
+        if (ich->type == ICMP_ECHOREPLY || ich->type == ICMP_ECHO) {
+            rte_pktmbuf_prepend(mbuf, (uint16_t)sizeof(struct ether_hdr));
+            icmp_recv_proc(mbuf);
+            return EDPVS_OK;
+        }
+    }
 #endif
 
     return INET_HOOK(AF_INET, INET_HOOK_PRE_ROUTING,
@@ -524,7 +545,7 @@ int ipv4_xmit(struct rte_mbuf *mbuf, const struct flow4 *fl4)
     struct route_entry *rt;
     struct ipv4_hdr *iph;
 
-    if (!mbuf || !fl4 || fl4->fl4_saddr.s_addr == htonl(INADDR_ANY)) {
+    if (!mbuf || !fl4) {
         if (mbuf)
             rte_pktmbuf_free(mbuf);
         return EDPVS_INVAL;
